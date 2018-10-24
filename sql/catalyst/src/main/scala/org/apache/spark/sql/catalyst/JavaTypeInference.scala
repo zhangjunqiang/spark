@@ -118,6 +118,9 @@ object JavaTypeInference {
         val (valueDataType, nullable) = inferDataType(valueType, seenTypeSet)
         (MapType(keyDataType, valueDataType, nullable), true)
 
+      case other if other.isEnum =>
+        (StringType, true)
+
       case other =>
         if (seenTypeSet.contains(other)) {
           throw new UnsupportedOperationException(
@@ -140,6 +143,7 @@ object JavaTypeInference {
   def getJavaBeanReadableProperties(beanClass: Class[_]): Array[PropertyDescriptor] = {
     val beanInfo = Introspector.getBeanInfo(beanClass)
     beanInfo.getPropertyDescriptors.filterNot(_.getName == "class")
+      .filterNot(_.getName == "declaringClass")
       .filter(_.getReadMethod != null)
   }
 
@@ -267,32 +271,27 @@ object JavaTypeInference {
 
       case c if listType.isAssignableFrom(typeToken) =>
         val et = elementType(typeToken)
-        MapObjects(
+        UnresolvedMapObjects(
           p => deserializerFor(et, Some(p)),
           getPath,
-          inferDataType(et)._1,
           customCollectionCls = Some(c))
 
       case _ if mapType.isAssignableFrom(typeToken) =>
         val (keyType, valueType) = mapKeyValueType(typeToken)
-        val keyDataType = inferDataType(keyType)._1
-        val valueDataType = inferDataType(valueType)._1
 
         val keyData =
           Invoke(
-            MapObjects(
+            UnresolvedMapObjects(
               p => deserializerFor(keyType, Some(p)),
-              Invoke(getPath, "keyArray", ArrayType(keyDataType)),
-              keyDataType),
+              GetKeyArrayFromMap(getPath)),
             "array",
             ObjectType(classOf[Array[Any]]))
 
         val valueData =
           Invoke(
-            MapObjects(
+            UnresolvedMapObjects(
               p => deserializerFor(valueType, Some(p)),
-              Invoke(getPath, "valueArray", ArrayType(valueDataType)),
-              valueDataType),
+              GetValueArrayFromMap(getPath)),
             "array",
             ObjectType(classOf[Array[Any]]))
 
@@ -301,6 +300,14 @@ object JavaTypeInference {
           ObjectType(classOf[JMap[_, _]]),
           "toJavaMap",
           keyData :: valueData :: Nil,
+          returnNullable = false)
+
+      case other if other.isEnum =>
+        StaticInvoke(
+          other,
+          ObjectType(other),
+          "valueOf",
+          Invoke(getPath, "toString", ObjectType(classOf[String]), returnNullable = false) :: Nil,
           returnNullable = false)
 
       case other =>
@@ -428,6 +435,14 @@ object JavaTypeInference {
             serializerFor(_, valueType),
             valueNullable = true
           )
+
+        case other if other.isEnum =>
+          StaticInvoke(
+            classOf[UTF8String],
+            StringType,
+            "fromString",
+            Invoke(inputObject, "name", ObjectType(classOf[String]), returnNullable = false) :: Nil,
+            returnNullable = false)
 
         case other =>
           val properties = getJavaBeanReadableAndWritableProperties(other)

@@ -22,11 +22,11 @@ import scala.reflect.ClassTag
 
 import org.apache.spark.SparkException
 import org.apache.spark.sql.Row
-import org.apache.spark.sql.catalyst.expressions._
-import org.apache.spark.sql.catalyst.util.{ArrayBasedMapData, ArrayData, DateTimeUtils, GenericArrayData}
 import org.apache.spark.sql.catalyst.ScalaReflection
 import org.apache.spark.sql.catalyst.analysis.GetColumnByOrdinal
+import org.apache.spark.sql.catalyst.expressions._
 import org.apache.spark.sql.catalyst.expressions.objects._
+import org.apache.spark.sql.catalyst.util.{ArrayBasedMapData, ArrayData, DateTimeUtils}
 import org.apache.spark.sql.types._
 import org.apache.spark.unsafe.types.UTF8String
 
@@ -171,7 +171,7 @@ object RowEncoder {
 
       if (inputObject.nullable) {
         If(IsNull(inputObject),
-          Literal.create(null, inputType),
+          Literal.create(null, nonNullOutput.dataType),
           nonNullOutput)
       } else {
         nonNullOutput
@@ -187,7 +187,9 @@ object RowEncoder {
         val convertedField = if (field.nullable) {
           If(
             Invoke(inputObject, "isNullAt", BooleanType, Literal(index) :: Nil),
-            Literal.create(null, field.dataType),
+            // Because we strip UDTs, `field.dataType` can be different from `fieldValue.dataType`.
+            // We should use `fieldValue.dataType` here.
+            Literal.create(null, fieldValue.dataType),
             fieldValue
           )
         } else {
@@ -198,7 +200,7 @@ object RowEncoder {
 
       if (inputObject.nullable) {
         If(IsNull(inputObject),
-          Literal.create(null, inputType),
+          Literal.create(null, nonNullOutput.dataType),
           nonNullOutput)
       } else {
         nonNullOutput

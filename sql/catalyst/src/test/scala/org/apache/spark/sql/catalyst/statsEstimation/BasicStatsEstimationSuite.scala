@@ -17,6 +17,8 @@
 
 package org.apache.spark.sql.catalyst.statsEstimation
 
+import org.apache.spark.sql.catalyst.dsl.expressions._
+import org.apache.spark.sql.catalyst.dsl.plans._
 import org.apache.spark.sql.catalyst.expressions.{Attribute, AttributeMap, AttributeReference, Literal}
 import org.apache.spark.sql.catalyst.plans.PlanTest
 import org.apache.spark.sql.catalyst.plans.logical._
@@ -26,8 +28,8 @@ import org.apache.spark.sql.types.IntegerType
 
 class BasicStatsEstimationSuite extends PlanTest with StatsEstimationTestBase {
   val attribute = attr("key")
-  val colStat = ColumnStat(distinctCount = 10, min = Some(1), max = Some(10),
-    nullCount = 0, avgLen = 4, maxLen = 4)
+  val colStat = ColumnStat(distinctCount = Some(10), min = Some(1), max = Some(10),
+    nullCount = Some(0), avgLen = Some(4), maxLen = Some(4))
 
   val plan = StatsTestPlan(
     outputList = Seq(attribute),
@@ -52,6 +54,24 @@ class BasicStatsEstimationSuite extends PlanTest with StatsEstimationTestBase {
       expectedStatsCboOn = filterStatsCboOn.copy(hints = HintInfo(broadcast = true)),
       expectedStatsCboOff = filterStatsCboOff.copy(hints = HintInfo(broadcast = true))
     )
+  }
+
+  test("range") {
+    val range = Range(1, 5, 1, None)
+    val rangeStats = Statistics(sizeInBytes = 4 * 8)
+    checkStats(
+      range,
+      expectedStatsCboOn = rangeStats,
+      expectedStatsCboOff = rangeStats)
+  }
+
+  test("windows") {
+    val windows = plan.window(Seq(min(attribute).as('sum_attr)), Seq(attribute), Nil)
+    val windowsStats = Statistics(sizeInBytes = plan.size.get * (4 + 4 + 8) / (4 + 8))
+    checkStats(
+      windows,
+      expectedStatsCboOn = windowsStats,
+      expectedStatsCboOff = windowsStats)
   }
 
   test("limit estimation: limit < child's rowCount") {
@@ -96,13 +116,17 @@ class BasicStatsEstimationSuite extends PlanTest with StatsEstimationTestBase {
         sizeInBytes = 40,
         rowCount = Some(10),
         attributeStats = AttributeMap(Seq(
-          AttributeReference("c1", IntegerType)() -> ColumnStat(10, Some(1), Some(10), 0, 4, 4))))
+          AttributeReference("c1", IntegerType)() -> ColumnStat(distinctCount = Some(10),
+            min = Some(1), max = Some(10),
+            nullCount = Some(0), avgLen = Some(4), maxLen = Some(4)))))
     val expectedCboStats =
       Statistics(
         sizeInBytes = 4,
         rowCount = Some(1),
         attributeStats = AttributeMap(Seq(
-          AttributeReference("c1", IntegerType)() -> ColumnStat(1, Some(5), Some(5), 0, 4, 4))))
+          AttributeReference("c1", IntegerType)() -> ColumnStat(distinctCount = Some(10),
+            min = Some(5), max = Some(5),
+            nullCount = Some(0), avgLen = Some(4), maxLen = Some(4)))))
 
     val plan = DummyLogicalPlan(defaultStats = expectedDefaultStats, cboStats = expectedCboStats)
     checkStats(

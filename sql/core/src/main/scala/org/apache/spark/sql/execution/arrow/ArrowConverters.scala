@@ -1,429 +1,284 @@
 /*
-* Licensed to the Apache Software Foundation (ASF) under one or more
-* contributor license agreements.  See the NOTICE file distributed with
-* this work for additional information regarding copyright ownership.
-* The ASF licenses this file to You under the Apache License, Version 2.0
-* (the "License"); you may not use this file except in compliance with
-* the License.  You may obtain a copy of the License at
-*
-*    http://www.apache.org/licenses/LICENSE-2.0
-*
-* Unless required by applicable law or agreed to in writing, software
-* distributed under the License is distributed on an "AS IS" BASIS,
-* WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-* See the License for the specific language governing permissions and
-* limitations under the License.
-*/
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *    http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
 
 package org.apache.spark.sql.execution.arrow
 
-import java.io.ByteArrayOutputStream
-import java.nio.channels.Channels
+import java.io.{ByteArrayInputStream, ByteArrayOutputStream, FileInputStream, OutputStream}
+import java.nio.channels.{Channels, ReadableByteChannel}
 
 import scala.collection.JavaConverters._
 
-import io.netty.buffer.ArrowBuf
-import org.apache.arrow.memory.{BufferAllocator, RootAllocator}
+import org.apache.arrow.flatbuf.MessageHeader
+import org.apache.arrow.memory.BufferAllocator
 import org.apache.arrow.vector._
-import org.apache.arrow.vector.BaseValueVector.BaseMutator
-import org.apache.arrow.vector.file._
-import org.apache.arrow.vector.schema.{ArrowFieldNode, ArrowRecordBatch}
-import org.apache.arrow.vector.types.FloatingPointPrecision
-import org.apache.arrow.vector.types.pojo.{ArrowType, Field, FieldType, Schema}
-import org.apache.arrow.vector.util.ByteArrayReadableSeekableByteChannel
+import org.apache.arrow.vector.ipc.{ArrowStreamWriter, ReadChannel, WriteChannel}
+import org.apache.arrow.vector.ipc.message.{ArrowRecordBatch, MessageSerializer}
 
+import org.apache.spark.TaskContext
+import org.apache.spark.api.java.JavaRDD
+import org.apache.spark.network.util.JavaUtils
+import org.apache.spark.rdd.RDD
+import org.apache.spark.sql.{DataFrame, SQLContext}
 import org.apache.spark.sql.catalyst.InternalRow
 import org.apache.spark.sql.types._
-import org.apache.spark.util.Utils
+import org.apache.spark.sql.vectorized.{ArrowColumnVector, ColumnarBatch, ColumnVector}
+import org.apache.spark.util.{ByteBufferOutputStream, Utils}
 
 
 /**
- * Store Arrow data in a form that can be serialized by Spark and served to a Python process.
+ * Writes serialized ArrowRecordBatches to a DataOutputStream in the Arrow stream format.
  */
-private[sql] class ArrowPayload private[arrow] (payload: Array[Byte]) extends Serializable {
+private[sql] class ArrowBatchStreamWriter(
+    schema: StructType,
+    out: OutputStream,
+    timeZoneId: String) {
+
+  val arrowSchema = ArrowUtils.toArrowSchema(schema, timeZoneId)
+  val writeChannel = new WriteChannel(Channels.newChannel(out))
+
+  // Write the Arrow schema first, before batches
+  MessageSerializer.serialize(writeChannel, arrowSchema)
 
   /**
-   * Convert the ArrowPayload to an ArrowRecordBatch.
+   * Consume iterator to write each serialized ArrowRecordBatch to the stream.
    */
-  def loadBatch(allocator: BufferAllocator): ArrowRecordBatch = {
-    ArrowConverters.byteArrayToBatch(payload, allocator)
+  def writeBatches(arrowBatchIter: Iterator[Array[Byte]]): Unit = {
+    arrowBatchIter.foreach(writeChannel.write)
   }
 
   /**
-   * Get the ArrowPayload as a type that can be served to Python.
+   * End the Arrow stream, does not close output stream.
    */
-  def asPythonSerializable: Array[Byte] = payload
-}
-
-private[sql] object ArrowPayload {
-
-  /**
-   * Create an ArrowPayload from an ArrowRecordBatch and Spark schema.
-   */
-  def apply(
-      batch: ArrowRecordBatch,
-      schema: StructType,
-      allocator: BufferAllocator): ArrowPayload = {
-    new ArrowPayload(ArrowConverters.batchToByteArray(batch, schema, allocator))
+  def end(): Unit = {
+    ArrowStreamWriter.writeEndOfStream(writeChannel)
   }
 }
 
 private[sql] object ArrowConverters {
 
   /**
-   * Map a Spark DataType to ArrowType.
+   * Maps Iterator from InternalRow to serialized ArrowRecordBatches. Limit ArrowRecordBatch size
+   * in a batch by setting maxRecordsPerBatch or use 0 to fully consume rowIter.
    */
-  private[arrow] def sparkTypeToArrowType(dataType: DataType): ArrowType = {
-    dataType match {
-      case BooleanType => ArrowType.Bool.INSTANCE
-      case ShortType => new ArrowType.Int(8 * ShortType.defaultSize, true)
-      case IntegerType => new ArrowType.Int(8 * IntegerType.defaultSize, true)
-      case LongType => new ArrowType.Int(8 * LongType.defaultSize, true)
-      case FloatType => new ArrowType.FloatingPoint(FloatingPointPrecision.SINGLE)
-      case DoubleType => new ArrowType.FloatingPoint(FloatingPointPrecision.DOUBLE)
-      case ByteType => new ArrowType.Int(8, true)
-      case StringType => ArrowType.Utf8.INSTANCE
-      case BinaryType => ArrowType.Binary.INSTANCE
-      case _ => throw new UnsupportedOperationException(s"Unsupported data type: $dataType")
-    }
-  }
-
-  /**
-   * Convert a Spark Dataset schema to Arrow schema.
-   */
-  private[arrow] def schemaToArrowSchema(schema: StructType): Schema = {
-    val arrowFields = schema.fields.map { f =>
-      new Field(f.name, f.nullable, sparkTypeToArrowType(f.dataType), List.empty[Field].asJava)
-    }
-    new Schema(arrowFields.toList.asJava)
-  }
-
-  /**
-   * Maps Iterator from InternalRow to ArrowPayload. Limit ArrowRecordBatch size in ArrowPayload
-   * by setting maxRecordsPerBatch or use 0 to fully consume rowIter.
-   */
-  private[sql] def toPayloadIterator(
+  private[sql] def toBatchIterator(
       rowIter: Iterator[InternalRow],
       schema: StructType,
-      maxRecordsPerBatch: Int): Iterator[ArrowPayload] = {
-    new Iterator[ArrowPayload] {
-      private val _allocator = new RootAllocator(Long.MaxValue)
-      private var _nextPayload = if (rowIter.nonEmpty) convert() else null
+      maxRecordsPerBatch: Int,
+      timeZoneId: String,
+      context: TaskContext): Iterator[Array[Byte]] = {
 
-      override def hasNext: Boolean = _nextPayload != null
+    val arrowSchema = ArrowUtils.toArrowSchema(schema, timeZoneId)
+    val allocator =
+      ArrowUtils.rootAllocator.newChildAllocator("toBatchIterator", 0, Long.MaxValue)
 
-      override def next(): ArrowPayload = {
-        val obj = _nextPayload
-        if (hasNext) {
-          if (rowIter.hasNext) {
-            _nextPayload = convert()
-          } else {
-            _allocator.close()
-            _nextPayload = null
-          }
-        }
-        obj
-      }
-
-      private def convert(): ArrowPayload = {
-        val batch = internalRowIterToArrowBatch(rowIter, schema, _allocator, maxRecordsPerBatch)
-        ArrowPayload(batch, schema, _allocator)
-      }
-    }
-  }
-
-  /**
-   * Iterate over InternalRows and write to an ArrowRecordBatch, stopping when rowIter is consumed
-   * or the number of records in the batch equals maxRecordsInBatch.  If maxRecordsPerBatch is 0,
-   * then rowIter will be fully consumed.
-   */
-  private def internalRowIterToArrowBatch(
-      rowIter: Iterator[InternalRow],
-      schema: StructType,
-      allocator: BufferAllocator,
-      maxRecordsPerBatch: Int = 0): ArrowRecordBatch = {
-
-    val columnWriters = schema.fields.zipWithIndex.map { case (field, ordinal) =>
-      ColumnWriter(field.dataType, ordinal, allocator).init()
-    }
-
-    val writerLength = columnWriters.length
-    var recordsInBatch = 0
-    while (rowIter.hasNext && (maxRecordsPerBatch <= 0 || recordsInBatch < maxRecordsPerBatch)) {
-      val row = rowIter.next()
-      var i = 0
-      while (i < writerLength) {
-        columnWriters(i).write(row)
-        i += 1
-      }
-      recordsInBatch += 1
-    }
-
-    val (fieldNodes, bufferArrays) = columnWriters.map(_.finish()).unzip
-    val buffers = bufferArrays.flatten
-
-    val rowLength = if (fieldNodes.nonEmpty) fieldNodes.head.getLength else 0
-    val recordBatch = new ArrowRecordBatch(rowLength,
-      fieldNodes.toList.asJava, buffers.toList.asJava)
-
-    buffers.foreach(_.release())
-    recordBatch
-  }
-
-  /**
-   * Convert an ArrowRecordBatch to a byte array and close batch to release resources. Once closed,
-   * the batch can no longer be used.
-   */
-  private[arrow] def batchToByteArray(
-      batch: ArrowRecordBatch,
-      schema: StructType,
-      allocator: BufferAllocator): Array[Byte] = {
-    val arrowSchema = ArrowConverters.schemaToArrowSchema(schema)
     val root = VectorSchemaRoot.create(arrowSchema, allocator)
-    val out = new ByteArrayOutputStream()
-    val writer = new ArrowFileWriter(root, null, Channels.newChannel(out))
+    val unloader = new VectorUnloader(root)
+    val arrowWriter = ArrowWriter.create(root)
 
-    // Write a batch to byte stream, ensure the batch, allocator and writer are closed
-    Utils.tryWithSafeFinally {
-      val loader = new VectorLoader(root)
-      loader.load(batch)
-      writer.writeBatch()  // writeBatch can throw IOException
-    } {
-      batch.close()
+    context.addTaskCompletionListener[Unit] { _ =>
       root.close()
-      writer.close()
+      allocator.close()
     }
-    out.toByteArray
+
+    new Iterator[Array[Byte]] {
+
+      override def hasNext: Boolean = rowIter.hasNext || {
+        root.close()
+        allocator.close()
+        false
+      }
+
+      override def next(): Array[Byte] = {
+        val out = new ByteArrayOutputStream()
+        val writeChannel = new WriteChannel(Channels.newChannel(out))
+
+        Utils.tryWithSafeFinally {
+          var rowCount = 0
+          while (rowIter.hasNext && (maxRecordsPerBatch <= 0 || rowCount < maxRecordsPerBatch)) {
+            val row = rowIter.next()
+            arrowWriter.write(row)
+            rowCount += 1
+          }
+          arrowWriter.finish()
+          val batch = unloader.getRecordBatch()
+          MessageSerializer.serialize(writeChannel, batch)
+          batch.close()
+        } {
+          arrowWriter.reset()
+        }
+
+        out.toByteArray
+      }
+    }
   }
 
   /**
-   * Convert a byte array to an ArrowRecordBatch.
+   * Maps iterator from serialized ArrowRecordBatches to InternalRows.
    */
-  private[arrow] def byteArrayToBatch(
+  private[sql] def fromBatchIterator(
+      arrowBatchIter: Iterator[Array[Byte]],
+      schema: StructType,
+      timeZoneId: String,
+      context: TaskContext): Iterator[InternalRow] = {
+    val allocator =
+      ArrowUtils.rootAllocator.newChildAllocator("fromBatchIterator", 0, Long.MaxValue)
+
+    val arrowSchema = ArrowUtils.toArrowSchema(schema, timeZoneId)
+    val root = VectorSchemaRoot.create(arrowSchema, allocator)
+
+    new Iterator[InternalRow] {
+      private var rowIter = if (arrowBatchIter.hasNext) nextBatch() else Iterator.empty
+
+      context.addTaskCompletionListener[Unit] { _ =>
+        root.close()
+        allocator.close()
+      }
+
+      override def hasNext: Boolean = rowIter.hasNext || {
+        if (arrowBatchIter.hasNext) {
+          rowIter = nextBatch()
+          true
+        } else {
+          root.close()
+          allocator.close()
+          false
+        }
+      }
+
+      override def next(): InternalRow = rowIter.next()
+
+      private def nextBatch(): Iterator[InternalRow] = {
+        val arrowRecordBatch = ArrowConverters.loadBatch(arrowBatchIter.next(), allocator)
+        val vectorLoader = new VectorLoader(root)
+        vectorLoader.load(arrowRecordBatch)
+        arrowRecordBatch.close()
+
+        val columns = root.getFieldVectors.asScala.map { vector =>
+          new ArrowColumnVector(vector).asInstanceOf[ColumnVector]
+        }.toArray
+
+        val batch = new ColumnarBatch(columns)
+        batch.setNumRows(root.getRowCount)
+        batch.rowIterator().asScala
+      }
+    }
+  }
+
+  /**
+   * Load a serialized ArrowRecordBatch.
+   */
+  private[arrow] def loadBatch(
       batchBytes: Array[Byte],
       allocator: BufferAllocator): ArrowRecordBatch = {
-    val in = new ByteArrayReadableSeekableByteChannel(batchBytes)
-    val reader = new ArrowFileReader(in, allocator)
-
-    // Read a batch from a byte stream, ensure the reader is closed
-    Utils.tryWithSafeFinally {
-      val root = reader.getVectorSchemaRoot  // throws IOException
-      val unloader = new VectorUnloader(root)
-      reader.loadNextBatch()  // throws IOException
-      unloader.getRecordBatch
-    } {
-      reader.close()
-    }
+    val in = new ByteArrayInputStream(batchBytes)
+    MessageSerializer.deserializeRecordBatch(
+      new ReadChannel(Channels.newChannel(in)), allocator)  // throws IOException
   }
-}
-
-/**
- * Interface for writing InternalRows to Arrow Buffers.
- */
-private[arrow] trait ColumnWriter {
-  def init(): this.type
-  def write(row: InternalRow): Unit
 
   /**
-   * Clear the column writer and return the ArrowFieldNode and ArrowBuf.
-   * This should be called only once after all the data is written.
+   * Create a DataFrame from an RDD of serialized ArrowRecordBatches.
    */
-  def finish(): (ArrowFieldNode, Array[ArrowBuf])
-}
-
-/**
- * Base class for flat arrow column writer, i.e., column without children.
- */
-private[arrow] abstract class PrimitiveColumnWriter(val ordinal: Int)
-  extends ColumnWriter {
-
-  def getFieldType(dtype: ArrowType): FieldType = FieldType.nullable(dtype)
-
-  def valueVector: BaseDataValueVector
-  def valueMutator: BaseMutator
-
-  def setNull(): Unit
-  def setValue(row: InternalRow): Unit
-
-  protected var count = 0
-  protected var nullCount = 0
-
-  override def init(): this.type = {
-    valueVector.allocateNew()
-    this
-  }
-
-  override def write(row: InternalRow): Unit = {
-    if (row.isNullAt(ordinal)) {
-      setNull()
-      nullCount += 1
-    } else {
-      setValue(row)
+  private[sql] def toDataFrame(
+      arrowBatchRDD: JavaRDD[Array[Byte]],
+      schemaString: String,
+      sqlContext: SQLContext): DataFrame = {
+    val schema = DataType.fromJson(schemaString).asInstanceOf[StructType]
+    val timeZoneId = sqlContext.sessionState.conf.sessionLocalTimeZone
+    val rdd = arrowBatchRDD.rdd.mapPartitions { iter =>
+      val context = TaskContext.get()
+      ArrowConverters.fromBatchIterator(iter, schema, timeZoneId, context)
     }
-    count += 1
+    sqlContext.internalCreateDataFrame(rdd.setName("arrow"), schema)
   }
-
-  override def finish(): (ArrowFieldNode, Array[ArrowBuf]) = {
-    valueMutator.setValueCount(count)
-    val fieldNode = new ArrowFieldNode(count, nullCount)
-    val valueBuffers = valueVector.getBuffers(true)
-    (fieldNode, valueBuffers)
-  }
-}
-
-private[arrow] class BooleanColumnWriter(dtype: ArrowType, ordinal: Int, allocator: BufferAllocator)
-  extends PrimitiveColumnWriter(ordinal) {
-  override val valueVector: NullableBitVector
-    = new NullableBitVector("BooleanValue", getFieldType(dtype), allocator)
-  override val valueMutator: NullableBitVector#Mutator = valueVector.getMutator
-
-  override def setNull(): Unit = valueMutator.setNull(count)
-  override def setValue(row: InternalRow): Unit
-    = valueMutator.setSafe(count, if (row.getBoolean(ordinal)) 1 else 0 )
-}
-
-private[arrow] class ShortColumnWriter(dtype: ArrowType, ordinal: Int, allocator: BufferAllocator)
-  extends PrimitiveColumnWriter(ordinal) {
-  override val valueVector: NullableSmallIntVector
-    = new NullableSmallIntVector("ShortValue", getFieldType(dtype: ArrowType), allocator)
-  override val valueMutator: NullableSmallIntVector#Mutator = valueVector.getMutator
-
-  override def setNull(): Unit = valueMutator.setNull(count)
-  override def setValue(row: InternalRow): Unit
-    = valueMutator.setSafe(count, row.getShort(ordinal))
-}
-
-private[arrow] class IntegerColumnWriter(dtype: ArrowType, ordinal: Int, allocator: BufferAllocator)
-  extends PrimitiveColumnWriter(ordinal) {
-  override val valueVector: NullableIntVector
-    = new NullableIntVector("IntValue", getFieldType(dtype), allocator)
-  override val valueMutator: NullableIntVector#Mutator = valueVector.getMutator
-
-  override def setNull(): Unit = valueMutator.setNull(count)
-  override def setValue(row: InternalRow): Unit
-    = valueMutator.setSafe(count, row.getInt(ordinal))
-}
-
-private[arrow] class LongColumnWriter(dtype: ArrowType, ordinal: Int, allocator: BufferAllocator)
-  extends PrimitiveColumnWriter(ordinal) {
-  override val valueVector: NullableBigIntVector
-    = new NullableBigIntVector("LongValue", getFieldType(dtype), allocator)
-  override val valueMutator: NullableBigIntVector#Mutator = valueVector.getMutator
-
-  override def setNull(): Unit = valueMutator.setNull(count)
-  override def setValue(row: InternalRow): Unit
-    = valueMutator.setSafe(count, row.getLong(ordinal))
-}
-
-private[arrow] class FloatColumnWriter(dtype: ArrowType, ordinal: Int, allocator: BufferAllocator)
-  extends PrimitiveColumnWriter(ordinal) {
-  override val valueVector: NullableFloat4Vector
-    = new NullableFloat4Vector("FloatValue", getFieldType(dtype), allocator)
-  override val valueMutator: NullableFloat4Vector#Mutator = valueVector.getMutator
-
-  override def setNull(): Unit = valueMutator.setNull(count)
-  override def setValue(row: InternalRow): Unit
-    = valueMutator.setSafe(count, row.getFloat(ordinal))
-}
-
-private[arrow] class DoubleColumnWriter(dtype: ArrowType, ordinal: Int, allocator: BufferAllocator)
-  extends PrimitiveColumnWriter(ordinal) {
-  override val valueVector: NullableFloat8Vector
-    = new NullableFloat8Vector("DoubleValue", getFieldType(dtype), allocator)
-  override val valueMutator: NullableFloat8Vector#Mutator = valueVector.getMutator
-
-  override def setNull(): Unit = valueMutator.setNull(count)
-  override def setValue(row: InternalRow): Unit
-    = valueMutator.setSafe(count, row.getDouble(ordinal))
-}
-
-private[arrow] class ByteColumnWriter(dtype: ArrowType, ordinal: Int, allocator: BufferAllocator)
-  extends PrimitiveColumnWriter(ordinal) {
-  override val valueVector: NullableUInt1Vector
-    = new NullableUInt1Vector("ByteValue", getFieldType(dtype), allocator)
-  override val valueMutator: NullableUInt1Vector#Mutator = valueVector.getMutator
-
-  override def setNull(): Unit = valueMutator.setNull(count)
-  override def setValue(row: InternalRow): Unit
-    = valueMutator.setSafe(count, row.getByte(ordinal))
-}
-
-private[arrow] class UTF8StringColumnWriter(
-    dtype: ArrowType,
-    ordinal: Int,
-    allocator: BufferAllocator)
-  extends PrimitiveColumnWriter(ordinal) {
-  override val valueVector: NullableVarCharVector
-    = new NullableVarCharVector("UTF8StringValue", getFieldType(dtype), allocator)
-  override val valueMutator: NullableVarCharVector#Mutator = valueVector.getMutator
-
-  override def setNull(): Unit = valueMutator.setNull(count)
-  override def setValue(row: InternalRow): Unit = {
-    val str = row.getUTF8String(ordinal)
-    valueMutator.setSafe(count, str.getByteBuffer, 0, str.numBytes)
-  }
-}
-
-private[arrow] class BinaryColumnWriter(dtype: ArrowType, ordinal: Int, allocator: BufferAllocator)
-  extends PrimitiveColumnWriter(ordinal) {
-  override val valueVector: NullableVarBinaryVector
-    = new NullableVarBinaryVector("BinaryValue", getFieldType(dtype), allocator)
-  override val valueMutator: NullableVarBinaryVector#Mutator = valueVector.getMutator
-
-  override def setNull(): Unit = valueMutator.setNull(count)
-  override def setValue(row: InternalRow): Unit = {
-    val bytes = row.getBinary(ordinal)
-    valueMutator.setSafe(count, bytes, 0, bytes.length)
-  }
-}
-
-private[arrow] class DateColumnWriter(dtype: ArrowType, ordinal: Int, allocator: BufferAllocator)
-  extends PrimitiveColumnWriter(ordinal) {
-  override val valueVector: NullableDateDayVector
-    = new NullableDateDayVector("DateValue", getFieldType(dtype), allocator)
-  override val valueMutator: NullableDateDayVector#Mutator = valueVector.getMutator
-
-  override def setNull(): Unit = valueMutator.setNull(count)
-  override def setValue(row: InternalRow): Unit = {
-    valueMutator.setSafe(count, row.getInt(ordinal))
-  }
-}
-
-private[arrow] class TimeStampColumnWriter(
-    dtype: ArrowType,
-    ordinal: Int,
-    allocator: BufferAllocator)
-  extends PrimitiveColumnWriter(ordinal) {
-  override val valueVector: NullableTimeStampMicroVector
-    = new NullableTimeStampMicroVector("TimeStampValue", getFieldType(dtype), allocator)
-  override val valueMutator: NullableTimeStampMicroVector#Mutator = valueVector.getMutator
-
-  override def setNull(): Unit = valueMutator.setNull(count)
-  override def setValue(row: InternalRow): Unit = {
-    valueMutator.setSafe(count, row.getLong(ordinal))
-  }
-}
-
-private[arrow] object ColumnWriter {
 
   /**
-   * Create an Arrow ColumnWriter given the type and ordinal of row.
+   * Read a file as an Arrow stream and parallelize as an RDD of serialized ArrowRecordBatches.
    */
-  def apply(dataType: DataType, ordinal: Int, allocator: BufferAllocator): ColumnWriter = {
-    val dtype = ArrowConverters.sparkTypeToArrowType(dataType)
-    dataType match {
-      case BooleanType => new BooleanColumnWriter(dtype, ordinal, allocator)
-      case ShortType => new ShortColumnWriter(dtype, ordinal, allocator)
-      case IntegerType => new IntegerColumnWriter(dtype, ordinal, allocator)
-      case LongType => new LongColumnWriter(dtype, ordinal, allocator)
-      case FloatType => new FloatColumnWriter(dtype, ordinal, allocator)
-      case DoubleType => new DoubleColumnWriter(dtype, ordinal, allocator)
-      case ByteType => new ByteColumnWriter(dtype, ordinal, allocator)
-      case StringType => new UTF8StringColumnWriter(dtype, ordinal, allocator)
-      case BinaryType => new BinaryColumnWriter(dtype, ordinal, allocator)
-      case DateType => new DateColumnWriter(dtype, ordinal, allocator)
-      case TimestampType => new TimeStampColumnWriter(dtype, ordinal, allocator)
-      case _ => throw new UnsupportedOperationException(s"Unsupported data type: $dataType")
+  private[sql] def readArrowStreamFromFile(
+      sqlContext: SQLContext,
+      filename: String): JavaRDD[Array[Byte]] = {
+    Utils.tryWithResource(new FileInputStream(filename)) { fileStream =>
+      // Create array to consume iterator so that we can safely close the file
+      val batches = getBatchesFromStream(fileStream.getChannel).toArray
+      // Parallelize the record batches to create an RDD
+      JavaRDD.fromRDD(sqlContext.sparkContext.parallelize(batches, batches.length))
+    }
+  }
+
+  /**
+   * Read an Arrow stream input and return an iterator of serialized ArrowRecordBatches.
+   */
+  private[sql] def getBatchesFromStream(in: ReadableByteChannel): Iterator[Array[Byte]] = {
+
+    // Iterate over the serialized Arrow RecordBatch messages from a stream
+    new Iterator[Array[Byte]] {
+      var batch: Array[Byte] = readNextBatch()
+
+      override def hasNext: Boolean = batch != null
+
+      override def next(): Array[Byte] = {
+        val prevBatch = batch
+        batch = readNextBatch()
+        prevBatch
+      }
+
+      // This gets the next serialized ArrowRecordBatch by reading message metadata to check if it
+      // is a RecordBatch message and then returning the complete serialized message which consists
+      // of a int32 length, serialized message metadata and a serialized RecordBatch message body
+      def readNextBatch(): Array[Byte] = {
+        val msgMetadata = MessageSerializer.readMessage(new ReadChannel(in))
+        if (msgMetadata == null) {
+          return null
+        }
+
+        // Get the length of the body, which has not been read at this point
+        val bodyLength = msgMetadata.getMessageBodyLength.toInt
+
+        // Only care about RecordBatch messages, skip Schema and unsupported Dictionary messages
+        if (msgMetadata.getMessage.headerType() == MessageHeader.RecordBatch) {
+
+          // Buffer backed output large enough to hold the complete serialized message
+          val bbout = new ByteBufferOutputStream(4 + msgMetadata.getMessageLength + bodyLength)
+
+          // Write message metadata to ByteBuffer output stream
+          MessageSerializer.writeMessageBuffer(
+            new WriteChannel(Channels.newChannel(bbout)),
+            msgMetadata.getMessageLength,
+            msgMetadata.getMessageBuffer)
+
+          // Get a zero-copy ByteBuffer with already contains message metadata, must close first
+          bbout.close()
+          val bb = bbout.toByteBuffer
+          bb.position(bbout.getCount())
+
+          // Read message body directly into the ByteBuffer to avoid copy, return backed byte array
+          bb.limit(bb.capacity())
+          JavaUtils.readFully(in, bb)
+          bb.array()
+        } else {
+          if (bodyLength > 0) {
+            // Skip message body if not a RecordBatch
+            Channels.newInputStream(in).skip(bodyLength)
+          }
+
+          // Proceed to next message
+          readNextBatch()
+        }
+      }
     }
   }
 }

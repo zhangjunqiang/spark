@@ -16,15 +16,11 @@ select + + 100;
 select - - max(key) from testdata;
 select + - key from testdata where key = 33;
 
--- div
+-- division
 select 5 / 2;
 select 5 / 0;
 select 5 / null;
 select null / 5;
-select 5 div 2;
-select 5 div 0;
-select 5 div null;
-select null div 5;
 
 -- other arithmetics
 select 1 + 2;
@@ -92,3 +88,7 @@ select abs(-3.13), abs('-2.19');
 
 -- positive/negative
 select positive('-1.11'), positive(-1.11), negative('-1.11'), negative(-1.11);
+
+-- pmod
+select pmod(-7, 2), pmod(0, 2), pmod(7, 0), pmod(7, null), pmod(null, 2), pmod(null, null);
+select pmod(cast(3.13 as decimal), cast(0 as decimal)), pmod(cast(2 as smallint), cast(0 as smallint));

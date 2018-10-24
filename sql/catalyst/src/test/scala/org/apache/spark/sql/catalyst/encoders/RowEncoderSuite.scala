@@ -19,8 +19,8 @@ package org.apache.spark.sql.catalyst.encoders
 
 import scala.util.Random
 
-import org.apache.spark.SparkFunSuite
 import org.apache.spark.sql.{RandomDataGenerator, Row}
+import org.apache.spark.sql.catalyst.plans.CodegenInterpretedPlanTest
 import org.apache.spark.sql.catalyst.util.{ArrayData, GenericArrayData}
 import org.apache.spark.sql.types._
 
@@ -71,7 +71,7 @@ class ExamplePointUDT extends UserDefinedType[ExamplePoint] {
   private[spark] override def asNullable: ExamplePointUDT = this
 }
 
-class RowEncoderSuite extends SparkFunSuite {
+class RowEncoderSuite extends CodegenInterpretedPlanTest {
 
   private val structOfString = new StructType().add("str", StringType)
   private val structOfUDT = new StructType().add("udt", new ExamplePointUDT, false)
@@ -271,6 +271,14 @@ class RowEncoderSuite extends SparkFunSuite {
       encoder.toRow(Row(Array("a")))
     }
     assert(e4.getMessage.contains("java.lang.String is not a valid external type"))
+  }
+
+  test("SPARK-25791: Datatype of serializers should be accessible") {
+    val udtSQLType = new StructType().add("a", IntegerType)
+    val pythonUDT = new PythonUserDefinedType(udtSQLType, "pyUDT", "serializedPyClass")
+    val schema = new StructType().add("pythonUDT", pythonUDT, true)
+    val encoder = RowEncoder(schema)
+    assert(encoder.serializer(0).dataType == pythonUDT.sqlType)
   }
 
   for {

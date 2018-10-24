@@ -98,7 +98,7 @@ case class CreateViewCommand(
 
   import ViewHelper._
 
-  override def innerChildren: Seq[QueryPlan[_]] = Seq(child)
+  override protected def innerChildren: Seq[QueryPlan[_]] = Seq(child)
 
   if (viewType == PersistedView) {
     require(originalText.isDefined, "'originalText' must be provided to create permanent view")
@@ -242,6 +242,7 @@ case class CreateViewCommand(
       storage = CatalogStorageFormat.empty,
       schema = aliasPlan(session, analyzedPlan).schema,
       properties = newProperties,
+      viewOriginalText = originalText,
       viewText = originalText,
       comment = comment
     )
@@ -267,7 +268,7 @@ case class AlterViewAsCommand(
 
   import ViewHelper._
 
-  override def innerChildren: Seq[QueryPlan[_]] = Seq(query)
+  override protected def innerChildren: Seq[QueryPlan[_]] = Seq(query)
 
   override def run(session: SparkSession): Seq[Row] = {
     // If the plan cannot be analyzed, throw an exception and don't proceed.
@@ -299,6 +300,7 @@ case class AlterViewAsCommand(
     val updatedViewMeta = viewMeta.copy(
       schema = analyzedPlan.schema,
       properties = newProperties,
+      viewOriginalText = Some(originalText),
       viewText = Some(originalText))
 
     session.sessionState.catalog.alterTable(updatedViewMeta)
